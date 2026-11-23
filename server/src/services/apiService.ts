@@ -1,5 +1,19 @@
 import { randomBytes } from "node:crypto";
-import { and, asc, desc, eq, gt, gte, ilike, isNotNull, isNull, lt, lte, or, sql } from "drizzle-orm";
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  gt,
+  gte,
+  ilike,
+  isNotNull,
+  isNull,
+  lt,
+  lte,
+  or,
+  sql,
+} from "drizzle-orm";
 import { db } from "../db/client.js";
 import { apiCalls, apis, apiDailyRollups, apiCallFinancialRecords } from "../db/schema.js";
 import { config, upstreamKeyRing } from "../config.js";
@@ -278,84 +292,59 @@ function toOwnerApi(api: ApiRecord): OwnerApi {
   };
 }
 
-export async function createApi(input: CreateApiInput): Promise<OwnerApi> {
-  const now = new Date().toISOString();
-  const id = randomUUID();
-  const ownershipToken = randomUUID().replace(/-/g, "");
-  const record: ApiRecord = {
-    id,
-    publisherId: input.publisherId,
-    name: input.name,
-    description: input.description ?? null,
-    upstreamUrl: input.upstreamUrl,
-    upstreamMethod: input.upstreamMethod ?? "GET",
-    upstreamHeaderValueEnc: input.upstreamHeaderValueEnc ?? null,
-    upstreamQueryValueEnc: input.upstreamQueryValueEnc ?? null,
-    price: input.price,
-    walletAddress: input.walletAddress,
-    ownershipToken,
-    ownershipVerified: false,
-    listed: false,
-    createdAt: now,
-    updatedAt: now,
-  };
+export interface CreateApiInput {
+  publisherId: string;
+  name: string;
+  description?: string;
+  upstreamUrl: string;
+  price: string;
+  priceRules?: ApiPriceRule[];
+  walletAddress: string;
+  allowedMethods: string[];
+  upstreamHeader?: { name: string; value: string };
+  upstreamQueryParam?: { name: string; value: string };
+  openapiSpec?: string | Record<string, unknown>;
+  timeoutMs?: number;
+  maxResponseBytes?: number;
+  webhook?: { url: string; secret: string };
+  healthPath?: string;
+  tags: string[];
+  payerAllowlist?: string[];
+  payerDenylist?: string[];
+  /** Issue #30: price of a time-limited access pass (undefined = passes not offered). */
+  passPrice?: string;
+  /** Issue #32: free calls per wallet per day before the paywall applies (0 = disabled). */
+  freeCallsPerDay?: number;
+}
 
-  export interface CreateApiInput {
-    publisherId: string;
-    name: string;
-    description?: string;
-    upstreamUrl: string;
-    price: string;
-    priceRules?: ApiPriceRule[];
-    walletAddress: string;
-    allowedMethods: string[];
-    upstreamHeader?: { name: string; value: string };
-    upstreamQueryParam?: { name: string; value: string };
-    openapiSpec?: string | Record<string, unknown>;
-    timeoutMs?: number;
-    maxResponseBytes?: number;
-    webhook?: { url: string; secret: string };
-    healthPath?: string;
-    tags: string[];
-    payerAllowlist?: string[];
-    payerDenylist?: string[];
-    /** Issue #30: price of a time-limited access pass (undefined = passes not offered). */
-    passPrice?: string;
-    /** Issue #32: free calls per wallet per day before the paywall applies (0 = disabled). */
-    freeCallsPerDay?: number;
-  }
-
-  export async function createApi(input: CreateApiInput): Promise<ApiRow> {
-    const [row] = await db
-      .insert(apis)
-      .values({
-        publisherId: input.publisherId,
-        name: input.name,
-        description: input.description,
-        upstreamUrl: checkedUpstreamUrl(input.upstreamUrl),
-        price: input.price,
-        priceRules: input.priceRules ?? [],
-        walletAddress: input.walletAddress,
-        allowedMethods: input.allowedMethods,
-        timeoutMs: clampTimeout(input.timeoutMs),
-        maxResponseBytes: checkedMaxResponseBytes(input.maxResponseBytes),
-        healthPath: input.healthPath,
-        tags: input.tags,
-        payerAllowlist: input.payerAllowlist ?? null,
-        payerDenylist: input.payerDenylist ?? [],
-        passPrice: input.passPrice ?? null,
-        freeCallsPerDay: input.freeCallsPerDay ?? 0,
-        ownershipToken: randomBytes(16).toString("hex"),
-        openapiSpec: checkedOpenApiSpec(input.openapiSpec),
-        streamingEnabled: input.streamingEnabled ?? false,
-        ...encryptedHeader(input.upstreamHeader),
-        ...encryptedQueryParam(input.upstreamQueryParam),
-      })
-      .returning();
-    return row;
-  }
-
-  return toOwnerApi(record);
+export async function createApi(input: CreateApiInput): Promise<ApiRow> {
+  const [row] = await db
+    .insert(apis)
+    .values({
+      publisherId: input.publisherId,
+      name: input.name,
+      description: input.description,
+      upstreamUrl: checkedUpstreamUrl(input.upstreamUrl),
+      price: input.price,
+      priceRules: input.priceRules ?? [],
+      walletAddress: input.walletAddress,
+      allowedMethods: input.allowedMethods,
+      timeoutMs: clampTimeout(input.timeoutMs),
+      maxResponseBytes: checkedMaxResponseBytes(input.maxResponseBytes),
+      healthPath: input.healthPath,
+      tags: input.tags,
+      payerAllowlist: input.payerAllowlist ?? null,
+      payerDenylist: input.payerDenylist ?? [],
+      passPrice: input.passPrice ?? null,
+      freeCallsPerDay: input.freeCallsPerDay ?? 0,
+      ownershipToken: randomBytes(16).toString("hex"),
+      openapiSpec: checkedOpenApiSpec(input.openapiSpec),
+      streamingEnabled: input.streamingEnabled ?? false,
+      ...encryptedHeader(input.upstreamHeader),
+      ...encryptedQueryParam(input.upstreamQueryParam),
+    })
+    .returning();
+  return row;
 }
 
 export async function getApiById(id: string): Promise<ApiRecord | null> {
@@ -430,7 +419,11 @@ export function scheduledPriceChanges(
   if (input.scheduledPrice === null) {
     return { scheduledPrice: null, effectiveAt: null };
   }
-  if (input.scheduledPrice === undefined || input.effectiveAt === undefined || input.effectiveAt === null) {
+  if (
+    input.scheduledPrice === undefined ||
+    input.effectiveAt === undefined ||
+    input.effectiveAt === null
+  ) {
     throw new ApiServiceError(422, "scheduledPrice and effectiveAt must be provided together");
   }
   const effectiveAt = new Date(input.effectiveAt);
@@ -466,7 +459,11 @@ export async function applyDuePriceChanges(now: Date = new Date()): Promise<numb
 /** The pending price change shown to callers and the owner, or null when none is scheduled. */
 export function pendingPriceChangeOf(api: Pick<ApiRow, "scheduledPrice" | "effectiveAt">) {
   if (!api.scheduledPrice || !api.effectiveAt) return null;
-  return { price: api.scheduledPrice, effectiveAt: api.effectiveAt.toISOString(), currency: "USDC" as const };
+  return {
+    price: api.scheduledPrice,
+    effectiveAt: api.effectiveAt.toISOString(),
+    currency: "USDC" as const,
+  };
 }
 
 export async function updateApi(api: ApiRow, input: UpdateApiInput): Promise<ApiRow> {
