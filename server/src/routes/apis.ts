@@ -74,6 +74,7 @@ import {
 } from "../lib/upstreamClient.js";
 import { filterRequestHeaders, filterResponseHeaders } from "../lib/proxyHeaders.js";
 import { paymentHeader, paymentHeaderHash, payerFromPayment } from "../lib/payer.js";
+import { passDurationOf, passPaymentOptions } from "../lib/accessPass.js";
 import {
   getProxyIdempotencyStore,
   type ProxyIdempotencyKey,
@@ -826,9 +827,8 @@ async function proxyIdempotency(req: Request, res: Response, next: NextFunction)
 
 // Issue #30: POST /api/:id/pass — buy a time-limited access pass via x402.
 // The caller pays passPrice once; subsequent calls are free until the pass
-// expires. Pass duration is 1 hour by default; providers may configure it via
-// the passPrice field (a future PATCH /apis/:id update can carry durationMs).
-const PASS_DURATION_MS = 60 * 60 * 1000; // 1 hour
+// expires. The provider sets the pass length (passDurationMs, 1 hour .. 30
+// days, #278) and the challenge always uses the gateway's Stellar network.
 
 router.post("/api/:id/pass", loadProxiedApi, async (req: Request, res: Response) => {
   const api = res.locals.api as ApiRow;
@@ -845,9 +845,7 @@ router.post("/api/:id/pass", loadProxiedApi, async (req: Request, res: Response)
   if (!payerAddress) {
     // No payment yet — return the 402 challenge so the caller knows how much
     // to pay. We reuse the same x402 resource-server path.
-    const network = api.network ?? "base-sepolia";
-    const payTo = api.walletAddress;
-    const price = api.passPrice;
+    const { network, payTo, price, durationMs, description } = passPaymentOptions(api);
 
     try {
       const resourceServer = await (
@@ -861,7 +859,7 @@ router.post("/api/:id/pass", loadProxiedApi, async (req: Request, res: Response)
         price,
         network,
         payTo,
-        description: `Access pass for ${api.name} (1 hour)`,
+        description,
       });
       middleware(req, res, () => {
         // Settlement happened synchronously (unlikely in x402 flow but
@@ -871,7 +869,7 @@ router.post("/api/:id/pass", loadProxiedApi, async (req: Request, res: Response)
           payerAddress: payerAddress ?? "unknown",
           amount: price,
           txHash: null,
-          durationMs: PASS_DURATION_MS,
+          durationMs,
         })
           .then((pass) => {
             if (!res.headersSent) {
@@ -914,7 +912,7 @@ router.post("/api/:id/pass", loadProxiedApi, async (req: Request, res: Response)
       payerAddress,
       amount: api.passPrice,
       txHash: null,
-      durationMs: PASS_DURATION_MS,
+      durationMs: passDurationOf(api),
     });
     res.status(201).json({
       passId: pass.id,

@@ -330,7 +330,14 @@ export const openApiSpec: OpenApiDocument = {
           passPrice: {
             ...usdcAmount,
             nullable: true,
-            description: "Price of a 1-hour access pass, or null if passes are not offered.",
+            description: "Price of an access pass, or null if passes are not offered.",
+          },
+          passDurationMs: {
+            type: "integer",
+            minimum: 3600000,
+            maximum: 2592000000,
+            description:
+              "How long an access pass lasts once bought, in milliseconds (1 hour to 30 days).",
           },
           freeCallsPerDay: {
             type: "integer",
@@ -1106,10 +1113,10 @@ export const openApiSpec: OpenApiDocument = {
       parameters: [paramRef("ApiId")],
       post: {
         tags: ["Proxy"],
-        summary: "Buy a 1-hour access pass",
+        summary: "Buy a time-limited access pass",
         description:
-          "Pays passPrice once via x402; calls from the same wallet are then free until the " +
-          "pass expires. Without a payment the gateway answers with the 402 challenge.",
+          "Pays passPrice once via x402 on the gateway's Stellar network; calls from the same " +
+          "wallet are then free for passDurationMs, until the pass expires. Without a payment the gateway answers with the 402 challenge.",
         operationId: "buyAccessPass",
         security: [{}, { X402Payment: [] }],
         responses: {

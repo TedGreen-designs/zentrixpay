@@ -1,5 +1,20 @@
 import { randomBytes } from "node:crypto";
-import { and, asc, desc, eq, gt, gte, ilike, isNotNull, isNull, lt, lte, or, sql } from "drizzle-orm";
+import { PASS_DURATION_DEFAULT_MS, passDurationOf } from "../lib/passDuration.js";
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  gt,
+  gte,
+  ilike,
+  isNotNull,
+  isNull,
+  lt,
+  lte,
+  or,
+  sql,
+} from "drizzle-orm";
 import { db } from "../db/client.js";
 import { apiCalls, apis, apiDailyRollups, apiCallFinancialRecords } from "../db/schema.js";
 import { config, upstreamKeyRing } from "../config.js";
@@ -74,6 +89,8 @@ export function toPublicApi(api: ApiRow) {
     tags: api.tags,
     // Issue #30: callers can see whether a pass is offered and at what price.
     passPrice: api.passPrice ?? null,
+    // Issue #278: how long a pass lasts once bought.
+    passDurationMs: passDurationOf(api),
     // Issue #32: free calls per day this provider offers to new callers.
     freeCallsPerDay: api.freeCallsPerDay,
     proxyUrl: proxyUrlOf(api),
@@ -321,6 +338,8 @@ export async function createApi(input: CreateApiInput): Promise<OwnerApi> {
     payerDenylist?: string[];
     /** Issue #30: price of a time-limited access pass (undefined = passes not offered). */
     passPrice?: string;
+    /** Issue #278: pass length in ms (1 hour .. 30 days; default 1 hour). */
+    passDurationMs?: number;
     /** Issue #32: free calls per wallet per day before the paywall applies (0 = disabled). */
     freeCallsPerDay?: number;
   }
@@ -344,6 +363,7 @@ export async function createApi(input: CreateApiInput): Promise<OwnerApi> {
         payerAllowlist: input.payerAllowlist ?? null,
         payerDenylist: input.payerDenylist ?? [],
         passPrice: input.passPrice ?? null,
+        passDurationMs: input.passDurationMs ?? PASS_DURATION_DEFAULT_MS,
         freeCallsPerDay: input.freeCallsPerDay ?? 0,
         ownershipToken: randomBytes(16).toString("hex"),
         openapiSpec: checkedOpenApiSpec(input.openapiSpec),
@@ -404,6 +424,8 @@ export interface UpdateApiInput {
   listed?: boolean;
   /** Issue #30: null disables passes; a new price enables / reprices them. */
   passPrice?: string | null;
+  /** Issue #278: pass length in ms (1 hour .. 30 days). */
+  passDurationMs?: number;
   /** Issue #32: 0 disables free calls. */
   freeCallsPerDay?: number;
   /** Issue #228: a future price and when it takes effect; null cancels a pending change. */
@@ -430,7 +452,11 @@ export function scheduledPriceChanges(
   if (input.scheduledPrice === null) {
     return { scheduledPrice: null, effectiveAt: null };
   }
-  if (input.scheduledPrice === undefined || input.effectiveAt === undefined || input.effectiveAt === null) {
+  if (
+    input.scheduledPrice === undefined ||
+    input.effectiveAt === undefined ||
+    input.effectiveAt === null
+  ) {
     throw new ApiServiceError(422, "scheduledPrice and effectiveAt must be provided together");
   }
   const effectiveAt = new Date(input.effectiveAt);
@@ -466,7 +492,11 @@ export async function applyDuePriceChanges(now: Date = new Date()): Promise<numb
 /** The pending price change shown to callers and the owner, or null when none is scheduled. */
 export function pendingPriceChangeOf(api: Pick<ApiRow, "scheduledPrice" | "effectiveAt">) {
   if (!api.scheduledPrice || !api.effectiveAt) return null;
-  return { price: api.scheduledPrice, effectiveAt: api.effectiveAt.toISOString(), currency: "USDC" as const };
+  return {
+    price: api.scheduledPrice,
+    effectiveAt: api.effectiveAt.toISOString(),
+    currency: "USDC" as const,
+  };
 }
 
 export async function updateApi(api: ApiRow, input: UpdateApiInput): Promise<ApiRow> {
@@ -509,6 +539,7 @@ export async function updateApi(api: ApiRow, input: UpdateApiInput): Promise<Api
     payerAllowlist: input.payerAllowlist,
     payerDenylist: input.payerDenylist,
     passPrice: input.passPrice,
+    passDurationMs: input.passDurationMs,
     freeCallsPerDay: input.freeCallsPerDay,
     ...encryptedHeader(input.upstreamHeader),
     ...encryptedQueryParam(input.upstreamQueryParam),
