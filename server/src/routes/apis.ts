@@ -538,7 +538,10 @@ async function proxyHandler(req: Request, res: Response) {
     if (charged && res.locals.creditPayer) gatewayCreditSpends.inc();
     const callId = randomUUID();
     const payerAddress =
-      (res.locals.creditPayer as string | undefined) ?? payerFrom(req, settlement);
+      (res.locals.creditPayer as string | undefined) ??
+      // Verified wallet of a pass or free-quota call (#276).
+      (res.locals.accessPayer as string | undefined) ??
+      payerFrom(req, settlement);
     const amount = (res.locals.apiCallPrice as string | undefined) ?? api.price;
     // Stored minimized: identifiers and the query string are dropped (#144).
     const path = minimizeCallPath(
@@ -606,13 +609,11 @@ async function proxyHandler(req: Request, res: Response) {
           },
           "upstream stream failed before first byte; caller not charged",
         );
-        res
-          .status(UPSTREAM_ERROR_STATUS[err.kind])
-          .json({
-            error: "upstream_failed",
-            reason: err.kind,
-            code: UPSTREAM_ERROR_CODES[err.kind],
-          });
+        res.status(UPSTREAM_ERROR_STATUS[err.kind]).json({
+          error: "upstream_failed",
+          reason: err.kind,
+          code: UPSTREAM_ERROR_CODES[err.kind],
+        });
         return;
       }
       throw err;
@@ -686,8 +687,7 @@ async function proxyHandler(req: Request, res: Response) {
   } satisfies StoredProxyResponse;
 
   const completeProxyIdempotency = res.locals.completeProxyIdempotency as
-    | ((response: StoredProxyResponse) => Promise<void>)
-    | undefined;
+    ((response: StoredProxyResponse) => Promise<void>) | undefined;
   if (completeProxyIdempotency && upstream.status < 400) {
     res.locals.preserveProxyIdempotencyClaim = true;
     await completeProxyIdempotency({
