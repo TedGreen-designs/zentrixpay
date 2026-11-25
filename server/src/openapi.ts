@@ -649,6 +649,10 @@ export const openApiSpec: OpenApiDocument = {
         properties: {
           passId: { type: "string" },
           expiresAt: { type: "string", format: "date-time" },
+          txHash: {
+            type: "string",
+            description: "Settlement transaction of the pass payment (on new passes).",
+          },
           message: { type: "string", enum: ["Pass activated", "Pass already active"] },
         },
       },
@@ -1127,6 +1131,9 @@ export const openApiSpec: OpenApiDocument = {
           "201": { description: "Pass activated.", content: json(schemaRef("AccessPass")) },
           "402": responseRef("PaymentRequired"),
           "404": responseRef("NotFound"),
+          "502": {
+            description: "The payment facilitator could not verify or settle the payment.",
+          },
         },
       },
     },

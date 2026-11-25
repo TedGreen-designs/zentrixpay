@@ -617,8 +617,8 @@ export interface CreatePassInput {
   payerAddress: string;
   /** USDC amount paid for the pass. */
   amount: string;
-  /** Settlement transaction hash. */
-  txHash: string | null;
+  /** Settlement transaction hash. Required: a pass exists only for a settled payment (#275). */
+  txHash: string;
   /** Pass duration in milliseconds. */
   durationMs: number;
 }
