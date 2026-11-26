@@ -300,3 +300,12 @@ export const apiStatsQuerySchema = z
   });
 
 export type ApiStatsQuery = z.infer<typeof apiStatsQuerySchema>;
+
+export const payerCallsQuerySchema = z
+  .object({
+    limit: z.coerce.number().int().min(1).max(STATS_MAX_LIMIT).default(STATS_DEFAULT_LIMIT),
+    offset: z.coerce.number().int().min(0).max(100_000).default(0),
+  })
+  .strict();
+
+export type PayerCallsQuery = z.infer<typeof payerCallsQuerySchema>;
