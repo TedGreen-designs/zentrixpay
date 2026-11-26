@@ -1,5 +1,6 @@
 import { x402ResourceServer } from "@x402/core/server";
 import { ExactStellarScheme } from "@x402/stellar/exact/server";
+import type { Network } from "@x402/core/types";
 import { config } from "../config.js";
 import { createLoggingFacilitatorClient } from "./loggingFacilitator.js";
 
@@ -18,9 +19,7 @@ export const network: string = config.NETWORK;
  */
 export const sharedX402ResourceServer: x402ResourceServer = (() => {
   const facilitator = createLoggingFacilitatorClient(config.FACILITATOR_URL);
-  // x402ResourceServer is a class; schemes are registered per network.
-  return new x402ResourceServer(facilitator).register(
-    network as `${string}:${string}`,
-    new ExactStellarScheme(),
-  );
+  const server = new x402ResourceServer(facilitator);
+  server.register(network as Network, new ExactStellarScheme());
+  return server;
 })();

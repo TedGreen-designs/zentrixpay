@@ -15,6 +15,7 @@ import { walletSignatureAuth } from "../middleware/walletSignatureAuth.js";
 import { validate } from "../middleware/validate.js";
 import { publishIpRateLimit, publishWalletRateLimit } from "../middleware/rateLimiters.js";
 import { ownershipVerifyRateLimit } from "../middleware/ownershipVerifyRateLimit.js";
+import { spendSignedApiCredit } from "../middleware/apiCreditSpend.js";
 import {
   apiPaywall,
   checkPayerAccess,
@@ -81,6 +82,7 @@ import {
 import { chargedCallWebhookEntry } from "../services/webhookService.js";
 import { decryptSecret } from "../utils/secretBox.js";
 import { stroopsToUsdc, usdcToStroops } from "../utils/usdc.js";
+import { minimizeCallPath } from "../lib/callPath.js";
 import { getLogger } from "../lib/logger.js";
 import { withSpan } from "../lib/spans.js";
 import {
@@ -92,6 +94,8 @@ import {
 import { config, upstreamKeyRing } from "../config.js";
 import { ProxyBufferSemaphore, proxyBufferConcurrency } from "../middleware/proxyBuffer.js";
 import { importBulkOpenApi, previewBulkOpenApi } from "../services/openApiImport.js";
+import { OpenApiSpecTooLargeError } from "../services/openApiSpec.js";
+import { proxyTrackingMiddleware } from "../middleware/proxyTracking.js";
 
 const router = Router();
 const openApiUpload = multer({ limits: { fileSize: 512 * 1024, files: 1 } });
@@ -128,8 +132,9 @@ router.post(
       return;
     }
     const result = previewBulkOpenApi(raw);
+    // Issue #214: oversized documents are 413; other validation failures stay 422.
     res
-      .status(result.errors.length > 0 ? 422 : 200)
+      .status(result.tooLarge ? 413 : result.errors.length > 0 ? 422 : 200)
       .json({ groups: result.groups, errors: result.errors });
   },
 );
@@ -155,7 +160,7 @@ router.post("/apis/import", apiKeyAuth, openApiUpload.single("document"), async 
     res.status(201).json(result);
   } catch (error) {
     res
-      .status(422)
+      .status(error instanceof OpenApiSpecTooLargeError ? 413 : 422)
       .json({ error: error instanceof Error ? error.message : "OpenAPI import failed" });
   }
 });
@@ -391,97 +396,271 @@ router.get("/payers/:address/entitlements", walletSignatureAuth, async (req, res
 
 // ── Paid proxy ────────────────────────────────────────────────────────────────
 
-/** Map /api/:id/<segments>?<query> onto the API's upstream URL. */
+/** Extract clean path segments from req.params.path (string or string array). */
+export function extractPathSegments(raw: unknown): string[] {
+  if (Array.isArray(raw)) {
+    return raw.flatMap((item) => (typeof item === "string" ? item.split("/").filter(Boolean) : []));
+  }
+  if (typeof raw === "string") {
+    return raw.split("/").filter(Boolean);
+  }
+  return [];
+}
+
+/**
+ * Map /api/:id/<segments>?<query> onto the API's upstream URL.
+ * Validates that the normalized request target stays strictly within the
+ * selected API's configured boundary (origin + base pathname).
+ * Returns null if any segment attempts traversal, contains invalid characters,
+ * or resolves outside the API's boundary.
+ */
 export function buildUpstreamUrl(
   upstreamUrl: string,
   segments: string[],
   originalUrl: string,
 ): URL | null {
-  // Segments arrive decoded. Refuse anything that could climb out of the
-  // upstream base path or smuggle a separator.
-  if (segments.some((s) => s === "." || s === ".." || /[/\\]/.test(s))) return null;
+  let base: URL;
+  try {
+    base = new URL(upstreamUrl);
+  } catch {
+    return null;
+  }
 
-  const base = new URL(upstreamUrl);
+  // Refuse anything that could climb out of the upstream base path,
+  // smuggle a separator, or introduce null bytes or control characters.
+  for (const s of segments) {
+    if (typeof s !== "string") return null;
+
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(s);
+    } catch {
+      return null;
+    }
+
+    if (
+      s === "." ||
+      s === ".." ||
+      decoded === "." ||
+      decoded === ".." ||
+      s.includes("/") ||
+      s.includes("\\") ||
+      decoded.includes("/") ||
+      decoded.includes("\\") ||
+      s.includes("\0") ||
+      decoded.includes("\0") ||
+      /%2e/i.test(s) ||
+      /%252e/i.test(s)
+    ) {
+      return null;
+    }
+  }
+
   const basePath = base.pathname.replace(/\/+$/, "");
   const subPath = segments.map(encodeURIComponent).join("/");
   const target = new URL(base.origin);
-  target.pathname = subPath ? `${basePath}/${subPath}` : basePath || "/";
+  const targetPath = subPath ? `${basePath}/${subPath}` : basePath || "/";
 
+  // Strict origin check: must match the configured upstream origin
+  if (target.origin !== base.origin) {
+    return null;
+  }
+
+  // Strict boundary check: normalized target must remain inside the API's configured basePath
+  if (basePath && basePath !== "/") {
+    if (targetPath !== basePath && !targetPath.startsWith(`${basePath}/`)) {
+      return null;
+    }
+  }
+
+  target.pathname = targetPath;
+
+  // Preserve upstream URL's existing query parameters while appending caller-supplied query
   const queryStart = originalUrl.indexOf("?");
   const requestQuery = queryStart === -1 ? "" : originalUrl.slice(queryStart + 1);
   target.search = [base.search.slice(1), requestQuery].filter(Boolean).join("&");
+
   return target;
 }
 
 function decodeQueryPart(part: string): string {
   try {
-    const decoded = Buffer.from(raw, "base64").toString("utf8");
-    const parsed = JSON.parse(decoded);
-    if (parsed && typeof parsed === "object") {
-      return {
-        success: typeof parsed.success === "boolean" ? parsed.success : undefined,
-        transaction: typeof parsed.transaction === "string" ? parsed.transaction : undefined,
-        network: typeof parsed.network === "string" ? parsed.network : undefined,
-        payer: typeof parsed.payer === "string" ? parsed.payer : undefined,
-      };
-    }
+    return decodeURIComponent(part.replace(/\+/g, " "));
   } catch {
-    // ignore malformed header
+    return part;
   }
-  return {};
 }
 
-/**
- * Resolve the payer address for a charged call.
- * Prefer the verified settlement payer from the PAYMENT-RESPONSE header,
- * then fall back to parsing the PAYMENT-SIGNATURE payload.
- */
-function resolvePayer(req: Request, res: Response): string {
-  const settlement = settlementFrom(res);
-  if (settlement.payer && settlement.payer !== "unknown") {
-    return settlement.payer;
-  }
-  const signature = req.get("PAYMENT-SIGNATURE") || req.get("X-PAYMENT") || undefined;
-  const parsed = parsePayerFromXPayment(signature);
-  return parsed || "unknown";
+interface SettlementInfo {
+  payer?: string;
+  transaction?: string;
 }
 
-/**
- * Proxy finish handler: records the completed call.
- * Called after the upstream provider responds.
- */
-export async function finishHandler(req: Request, res: Response) {
-  const apiId = req.params.id;
-  const startedAt: number = (req as any).callStartedAt ?? Date.now();
-  const statusCode = res.statusCode;
-  const charged = Boolean((req as any).callCharged);
-  const latencyMs = Date.now() - startedAt;
-
-  let payerAddress: string | null = null;
-  let settlementTx: string | null = null;
-
-  if (charged) {
-    payerAddress = resolvePayer(req, res);
-    const settlement = settlementFrom(res);
-    settlementTx = settlement.transaction ?? null;
-  }
-
+/** The settlement the x402 middleware reported on the response, if any. */
+function settlementFrom(res: Response): SettlementInfo {
+  const header = res.getHeader("payment-response") ?? res.getHeader("x-payment-response");
+  if (typeof header !== "string") return {};
   try {
-    await db.insert(apiCalls).values({
-      apiId,
-      statusCode,
-      latencyMs,
-      charged,
-      payerAddress,
-      settlementTx,
-      createdAt: new Date(),
-    });
-  } catch (err) {
-    console.error("Failed to record api call", err);
+    const decoded = JSON.parse(Buffer.from(header, "base64").toString("utf8"));
+    return {
+      payer: typeof decoded?.payer === "string" ? decoded.payer : undefined,
+      transaction:
+        typeof decoded?.transaction === "string" && decoded.transaction
+          ? decoded.transaction
+          : undefined,
+    };
+  } catch {
+    return {};
   }
+}
+
+function payerFrom(req: Request, settlement: SettlementInfo): string {
+  return settlement.payer ?? payerFromPayment(paymentHeader(req)).address ?? "unknown";
 }
 
 const UPSTREAM_ERROR_STATUS = { blocked: 502, network: 502, too_large: 502, timeout: 504 } as const;
+
+/**
+ * Set the provider's secret query parameter on the upstream URL. Any value the
+ * caller sent under the same name is dropped so it cannot override the
+ * provider's key. The rest of the query string is left byte-for-byte as sent.
+ */
+export function withSecretQueryParam(target: URL, name: string, value: string): URL {
+  const kept = target.search
+    .slice(1)
+    .split("&")
+    .filter((pair) => pair && decodeQueryPart(pair.split("=")[0]) !== name);
+  kept.push(`${encodeURIComponent(name)}=${encodeURIComponent(value)}`);
+  target.search = kept.join("&");
+  return target;
+}
+
+export interface UpstreamSecrets {
+  queryName?: string;
+  values: string[];
+}
+
+/** Remove a secret query parameter (by name or by value) from a URL-ish string. */
+function stripSecretParam(value: string, secrets: UpstreamSecrets): string {
+  const queryStart = value.indexOf("?");
+  if (queryStart === -1) return value;
+  const hashStart = value.indexOf("#", queryStart);
+  const query = value.slice(queryStart + 1, hashStart === -1 ? undefined : hashStart);
+  const kept = query.split("&").filter((pair) => {
+    if (!pair) return false;
+    const [rawKey, ...rest] = pair.split("=");
+    const key = decodeQueryPart(rawKey);
+    return key !== secrets.queryName && !secrets.values.includes(decodeQueryPart(rest.join("=")));
+  });
+  return (
+    value.slice(0, queryStart) +
+    (kept.length ? `?${kept.join("&")}` : "") +
+    (hashStart === -1 ? "" : value.slice(hashStart))
+  );
+}
+
+/** Replace any literal (or URL-encoded) occurrence of a secret value. */
+function redactSecrets(value: string, secrets: UpstreamSecrets): string {
+  let out = value;
+  for (const secret of secrets.values) {
+    if (secret.length < 4) continue;
+    for (const form of new Set([secret, encodeURIComponent(secret)])) {
+      out = out.split(form).join("[redacted]");
+    }
+  }
+  return out;
+}
+
+// Response headers that carry URLs; secret query parameters are removed from these.
+const URL_HEADERS = new Set(["location", "content-location", "link", "refresh"]);
+
+/**
+ * Rewrite or suppress a redirect target pointing to the configured upstream origin.
+ * - If the redirect points to the configured upstream origin and falls within the
+ *   API's configured base path, it is rewritten to the gateway proxy:
+ *   `${config.BASE_URL}/api/${api.id}${subpath}`
+ * - If the redirect points to the configured upstream origin but falls outside the
+ *   API's configured base path, it is suppressed (returns null) so responses do not
+ *   disclose private upstream origin details to callers.
+ * - If the redirect points to an unrelated external destination, it is preserved as-is.
+ */
+export function rewriteOrSuppressRedirect(
+  location: string,
+  api: Pick<ApiRow, "id" | "upstreamUrl">,
+): string | null {
+  let base: URL;
+  try {
+    base = new URL(api.upstreamUrl);
+  } catch {
+    return null;
+  }
+
+  // Base directory with trailing slash for resolving relative subpaths accurately
+  const baseDir = new URL(
+    base.pathname.endsWith("/") ? base.pathname : `${base.pathname}/`,
+    base.origin,
+  );
+
+  let target: URL;
+  try {
+    target = new URL(location, baseDir);
+  } catch {
+    return null;
+  }
+
+  const isUpstreamOrigin = target.origin.toLowerCase() === base.origin.toLowerCase();
+
+  if (isUpstreamOrigin) {
+    const basePath = base.pathname.replace(/\/+$/, "");
+    const targetPath = target.pathname.replace(/\/+$/, "");
+
+    const isWithinBoundary =
+      !basePath ||
+      basePath === "/" ||
+      targetPath === basePath ||
+      target.pathname.startsWith(`${basePath}/`);
+
+    if (isWithinBoundary) {
+      const subpath =
+        basePath && basePath !== "/" ? target.pathname.slice(basePath.length) : target.pathname;
+      const cleanSubpath = subpath ? (subpath.startsWith("/") ? subpath : `/${subpath}`) : "";
+      return `${config.BASE_URL}/api/${api.id}${cleanSubpath}${target.search}${target.hash}`;
+    }
+
+    // Redirect points to the upstream origin but outside its base path:
+    // Suppress it to prevent disclosing private upstream origin details.
+    return null;
+  }
+
+  // Preserves redirects to unrelated external destinations according to policy
+  return location;
+}
+
+/**
+ * Prepare an upstream response header for the caller: rewrite or suppress upstream URLs,
+ * preserve external destinations, and make sure no provider secret is echoed back.
+ */
+export function rewriteResponseHeader(
+  name: string,
+  value: string,
+  api: ApiRow,
+  secrets: UpstreamSecrets,
+): string | null {
+  const lowerName = name.toLowerCase();
+  let out = value;
+
+  if (lowerName === "location" || lowerName === "content-location") {
+    const rewritten = rewriteOrSuppressRedirect(out, api);
+    if (!rewritten) return null;
+    out = rewritten;
+  }
+
+  if (URL_HEADERS.has(lowerName)) {
+    out = stripSecretParam(out, secrets);
+  }
+
+  return redactSecrets(out, secrets);
+}
 
 /** Build and inject upstream secrets into headers/url, returning the secrets manifest. */
 function prepareUpstreamRequest(
@@ -496,7 +675,7 @@ function prepareUpstreamRequest(
       upstreamKeyRing,
       config.UPSTREAM_SECRET_KEY,
     );
-    headers[api.upstreamHeaderName] = value;
+    reqHeaders[api.upstreamHeaderName] = value;
     secrets.values.push(value);
   }
   if (api.upstreamQueryName && api.upstreamQueryValueEnc && upstreamKeyRing.length > 0) {
@@ -512,10 +691,33 @@ function prepareUpstreamRequest(
   return secrets;
 }
 
+/**
+ * Validate that caller-supplied sub-path stays strictly within the selected API's
+ * boundary and contains no path traversal or separator smuggling.
+ * Runs early in the proxy middleware pipeline before charging or buffering.
+ */
+export function validateProxyPath(req: Request, res: Response, next: NextFunction): void {
+  const api = res.locals.api as ApiRow;
+  if (!api) {
+    res.status(404).json({ error: "API not found" });
+    return;
+  }
+  const segments = extractPathSegments(req.params.path);
+  const target = buildUpstreamUrl(api.upstreamUrl, segments, req.originalUrl);
+  if (!target) {
+    res.status(400).json({ error: "Invalid path", code: "invalid_path" });
+    return;
+  }
+  res.locals.upstreamTarget = target;
+  next();
+}
+
 async function proxyHandler(req: Request, res: Response) {
   const api = res.locals.api as ApiRow;
-  const segments = (req.params.path as unknown as string[] | undefined) ?? [];
-  const target = buildUpstreamUrl(api.upstreamUrl, segments, req.originalUrl);
+  const segments = extractPathSegments(req.params.path);
+  const target =
+    (res.locals.upstreamTarget as URL | undefined) ??
+    buildUpstreamUrl(api.upstreamUrl, segments, req.originalUrl);
   if (!target) {
     res.status(400).json({ error: "Invalid path", code: "invalid_path" });
     return;
@@ -555,6 +757,7 @@ async function proxyHandler(req: Request, res: Response) {
       amount,
       method: req.method,
       path,
+      txHash: settlement.transaction ?? null,
       responseStatus: res.statusCode,
       durationMs,
       // Charged-call webhook goes to the outbox in the same transaction (#208).
@@ -622,9 +825,17 @@ async function proxyHandler(req: Request, res: Response) {
     const responseHeaders = filterResponseHeaders(upstream.headers);
     res.status(upstream.status);
     for (const [name, value] of Object.entries(responseHeaders)) {
-      const rewritten =
-        typeof value === "string" ? rewriteResponseHeader(name, value, api, secrets) : value;
-      res.setHeader(name, rewritten);
+      if (typeof value === "string") {
+        const rewritten = rewriteResponseHeader(name, value, api, secrets);
+        if (rewritten !== null) res.setHeader(name, rewritten);
+      } else if (Array.isArray(value)) {
+        const rewritten = value
+          .map((v) => (typeof v === "string" ? rewriteResponseHeader(name, v, api, secrets) : v))
+          .filter((v): v is string => v !== null);
+        if (rewritten.length > 0) res.setHeader(name, rewritten);
+      } else {
+        res.setHeader(name, value);
+      }
     }
 
     // For SSE: disable compression / buffering on the Express response so
@@ -675,8 +886,17 @@ async function proxyHandler(req: Request, res: Response) {
 
   const responseHeaders: StoredProxyResponse["headers"] = {};
   for (const [name, value] of Object.entries(filterResponseHeaders(upstream.headers))) {
-    responseHeaders[name] =
-      typeof value === "string" ? rewriteResponseHeader(name, value, api, secrets) : value;
+    if (typeof value === "string") {
+      const rewritten = rewriteResponseHeader(name, value, api, secrets);
+      if (rewritten !== null) responseHeaders[name] = rewritten;
+    } else if (Array.isArray(value)) {
+      const rewritten = value
+        .map((v) => (typeof v === "string" ? rewriteResponseHeader(name, v, api, secrets) : v))
+        .filter((v): v is string => v !== null);
+      if (rewritten.length > 0) responseHeaders[name] = rewritten;
+    } else {
+      responseHeaders[name] = value;
+    }
   }
   // Kept for Idempotency-Key replay once the call is known to be charged.
   res.locals.proxyResponse = {
@@ -832,9 +1052,11 @@ router.post("/api/:id/pass", loadProxiedApi, checkPayerAllowDeny, buyAccessPass)
 // ANY /api/:id[/*path] — one paid call to the provider's API
 router.all(
   "/api/:id{/*path}",
+  proxyTrackingMiddleware,
   proxyIpRateLimit,
   proxyBufferLimit,
   loadProxiedApi,
+  validateProxyPath,
   express.raw({ type: () => true, limit: config.PROXY_MAX_REQUEST_BODY }),
   checkPayerAllowDeny,
   checkPayerAccess,

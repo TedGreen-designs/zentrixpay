@@ -9,6 +9,43 @@ export const publisherRegisterSchema = z
   })
   .strict();
 
+// ── Display text: names, descriptions and tags (issue #215) ──────────────────
+// These strings appear in the catalog and in MCP output that AI agents read.
+// Control characters, bidi overrides and zero-width characters let a name
+// spoof another API or smuggle instructions, so they are rejected. Text is
+// normalized to NFC first, so visually identical strings compare equal.
+
+// Bidi embedding/override/isolate controls (incl. LRM/RLM/ALM), zero-width joiners and spaces, BOM.
+const BIDI_AND_ZERO_WIDTH = /[\u061C\u200B-\u200F\u202A-\u202E\u2060-\u2069\uFEFF]/;
+
+/** C0 and C1 controls. Tab, LF and CR are allowed only where line breaks make sense. */
+function hasControlChar(value: string, multiline: boolean): boolean {
+  for (const ch of value) {
+    const code = ch.codePointAt(0)!;
+    if (multiline && (code === 0x09 || code === 0x0a || code === 0x0d)) continue;
+    if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) return true;
+  }
+  return false;
+}
+
+function hasUnsafeDisplayChars(value: string, multiline: boolean): boolean {
+  return hasControlChar(value, multiline) || BIDI_AND_ZERO_WIDTH.test(value);
+}
+
+const UNSAFE_TEXT_MESSAGE = "must not contain control, bidi-override or zero-width characters";
+
+/** Plain single-line text: normalized to NFC, no controls or Unicode tricks. */
+const displayLine = z
+  .string()
+  .transform((v) => v.normalize("NFC"))
+  .refine((v) => !hasUnsafeDisplayChars(v, false), UNSAFE_TEXT_MESSAGE);
+
+/** Multi-line text (descriptions): tab and line breaks are allowed. */
+const displayText = z
+  .string()
+  .transform((v) => v.normalize("NFC"))
+  .refine((v) => !hasUnsafeDisplayChars(v, true), UNSAFE_TEXT_MESSAGE);
+
 export const CATALOG_DEFAULT_LIMIT = 20;
 export const CATALOG_MAX_LIMIT = 100;
 
@@ -120,7 +157,7 @@ const healthPath = z
 // The upper bound (PROXY_MAX_RESPONSE_BYTES) is enforced by the service.
 const maxResponseBytes = z.number().int().min(1024);
 
-const tagList = z.array(z.string().trim().min(1).max(32).toLowerCase()).max(10);
+const tagList = z.array(z.string().trim().min(1).max(32).toLowerCase().pipe(displayLine)).max(10);
 
 export const PAYER_LIST_MAX = 500;
 
@@ -138,8 +175,8 @@ const passDurationMs = z
 
 export const createApiSchema = z
   .object({
-    name: z.string().trim().min(1).max(120),
-    description: z.string().max(2000).optional(),
+    name: z.string().trim().min(1).max(120).pipe(displayLine),
+    description: z.string().max(2000).pipe(displayText).optional(),
     upstreamUrl: z.url(),
     price: usdcPrice,
     priceRules: apiPriceRules.default([]),
@@ -167,8 +204,8 @@ export const createApiSchema = z
 
 export const updateApiSchema = z
   .object({
-    name: z.string().trim().min(1).max(120).optional(),
-    description: z.string().max(2000).nullable().optional(),
+    name: z.string().trim().min(1).max(120).pipe(displayLine).optional(),
+    description: z.string().max(2000).pipe(displayText).nullable().optional(),
     upstreamUrl: z.url().optional(),
     price: usdcPrice.optional(),
     priceRules: apiPriceRules.nullable().optional(),
@@ -275,3 +312,12 @@ export const apiStatsQuerySchema = z
   });
 
 export type ApiStatsQuery = z.infer<typeof apiStatsQuerySchema>;
+
+export const payerCallsQuerySchema = z
+  .object({
+    limit: z.coerce.number().int().min(1).max(STATS_MAX_LIMIT).default(STATS_DEFAULT_LIMIT),
+    offset: z.coerce.number().int().min(0).max(100_000).default(0),
+  })
+  .strict();
+
+export type PayerCallsQuery = z.infer<typeof payerCallsQuerySchema>;

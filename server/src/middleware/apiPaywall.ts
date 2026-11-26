@@ -276,7 +276,7 @@ export async function checkPayerAccess(
         .where(
           and(
             eq(apiCalls.apiId, api.id),
-            eq(apiCalls.payer, payerAddress),
+            eq(apiCalls.payerAddress, payerAddress),
             eq(apiCalls.charged, false),
             sql`${apiCalls.createdAt} >= date_trunc('day', now() at time zone 'UTC')`,
           ),
