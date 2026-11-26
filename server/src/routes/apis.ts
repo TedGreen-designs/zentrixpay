@@ -576,21 +576,90 @@ function redactSecrets(value: string, secrets: UpstreamSecrets): string {
 const URL_HEADERS = new Set(["location", "content-location", "link", "refresh"]);
 
 /**
- * Prepare an upstream response header for the caller: point upstream URLs at
- * the proxy and make sure no provider secret is echoed back.
+ * Rewrite or suppress a redirect target pointing to the configured upstream origin.
+ * - If the redirect points to the configured upstream origin and falls within the
+ *   API's configured base path, it is rewritten to the gateway proxy:
+ *   `${config.BASE_URL}/api/${api.id}${subpath}`
+ * - If the redirect points to the configured upstream origin but falls outside the
+ *   API's configured base path, it is suppressed (returns null) so responses do not
+ *   disclose private upstream origin details to callers.
+ * - If the redirect points to an unrelated external destination, it is preserved as-is.
+ */
+export function rewriteOrSuppressRedirect(
+  location: string,
+  api: Pick<ApiRow, "id" | "upstreamUrl">,
+): string | null {
+  let base: URL;
+  try {
+    base = new URL(api.upstreamUrl);
+  } catch {
+    return null;
+  }
+
+  // Base directory with trailing slash for resolving relative subpaths accurately
+  const baseDir = new URL(
+    base.pathname.endsWith("/") ? base.pathname : `${base.pathname}/`,
+    base.origin,
+  );
+
+  let target: URL;
+  try {
+    target = new URL(location, baseDir);
+  } catch {
+    return null;
+  }
+
+  const isUpstreamOrigin = target.origin.toLowerCase() === base.origin.toLowerCase();
+
+  if (isUpstreamOrigin) {
+    const basePath = base.pathname.replace(/\/+$/, "");
+    const targetPath = target.pathname.replace(/\/+$/, "");
+
+    const isWithinBoundary =
+      !basePath ||
+      basePath === "/" ||
+      targetPath === basePath ||
+      target.pathname.startsWith(`${basePath}/`);
+
+    if (isWithinBoundary) {
+      const subpath =
+        basePath && basePath !== "/" ? target.pathname.slice(basePath.length) : target.pathname;
+      const cleanSubpath = subpath ? (subpath.startsWith("/") ? subpath : `/${subpath}`) : "";
+      return `${config.BASE_URL}/api/${api.id}${cleanSubpath}${target.search}${target.hash}`;
+    }
+
+    // Redirect points to the upstream origin but outside its base path:
+    // Suppress it to prevent disclosing private upstream origin details.
+    return null;
+  }
+
+  // Preserves redirects to unrelated external destinations according to policy
+  return location;
+}
+
+/**
+ * Prepare an upstream response header for the caller: rewrite or suppress upstream URLs,
+ * preserve external destinations, and make sure no provider secret is echoed back.
  */
 export function rewriteResponseHeader(
   name: string,
   value: string,
   api: ApiRow,
   secrets: UpstreamSecrets,
-): string {
+): string | null {
+  const lowerName = name.toLowerCase();
   let out = value;
-  if (name === "location") {
-    const base = api.upstreamUrl.replace(/\/+$/, "");
-    if (out.startsWith(base)) out = `${config.BASE_URL}/api/${api.id}${out.slice(base.length)}`;
+
+  if (lowerName === "location" || lowerName === "content-location") {
+    const rewritten = rewriteOrSuppressRedirect(out, api);
+    if (!rewritten) return null;
+    out = rewritten;
   }
-  if (URL_HEADERS.has(name)) out = stripSecretParam(out, secrets);
+
+  if (URL_HEADERS.has(lowerName)) {
+    out = stripSecretParam(out, secrets);
+  }
+
   return redactSecrets(out, secrets);
 }
 
@@ -754,9 +823,17 @@ async function proxyHandler(req: Request, res: Response) {
     const responseHeaders = filterResponseHeaders(upstream.headers);
     res.status(upstream.status);
     for (const [name, value] of Object.entries(responseHeaders)) {
-      const rewritten =
-        typeof value === "string" ? rewriteResponseHeader(name, value, api, secrets) : value;
-      res.setHeader(name, rewritten);
+      if (typeof value === "string") {
+        const rewritten = rewriteResponseHeader(name, value, api, secrets);
+        if (rewritten !== null) res.setHeader(name, rewritten);
+      } else if (Array.isArray(value)) {
+        const rewritten = value
+          .map((v) => (typeof v === "string" ? rewriteResponseHeader(name, v, api, secrets) : v))
+          .filter((v): v is string => v !== null);
+        if (rewritten.length > 0) res.setHeader(name, rewritten);
+      } else {
+        res.setHeader(name, value);
+      }
     }
 
     // For SSE: disable compression / buffering on the Express response so
@@ -807,8 +884,17 @@ async function proxyHandler(req: Request, res: Response) {
 
   const responseHeaders: StoredProxyResponse["headers"] = {};
   for (const [name, value] of Object.entries(filterResponseHeaders(upstream.headers))) {
-    responseHeaders[name] =
-      typeof value === "string" ? rewriteResponseHeader(name, value, api, secrets) : value;
+    if (typeof value === "string") {
+      const rewritten = rewriteResponseHeader(name, value, api, secrets);
+      if (rewritten !== null) responseHeaders[name] = rewritten;
+    } else if (Array.isArray(value)) {
+      const rewritten = value
+        .map((v) => (typeof v === "string" ? rewriteResponseHeader(name, v, api, secrets) : v))
+        .filter((v): v is string => v !== null);
+      if (rewritten.length > 0) responseHeaders[name] = rewritten;
+    } else {
+      responseHeaders[name] = value;
+    }
   }
   // Kept for Idempotency-Key replay once the call is known to be charged.
   res.locals.proxyResponse = {
