@@ -146,8 +146,18 @@ describe("buildUpstreamUrl", () => {
 
   it("refuses traversal and smuggled separators", () => {
     expect(buildUpstreamUrl("https://api.example.com/v1", [".."], "/api/x/..")).toBeNull();
+    expect(buildUpstreamUrl("https://api.example.com/v1", ["."], "/api/x/.")).toBeNull();
+    expect(buildUpstreamUrl("https://api.example.com/v1", ["%2e%2e"], "/api/x/%2e%2e")).toBeNull();
+    expect(buildUpstreamUrl("https://api.example.com/v1", ["%2E%2E"], "/api/x/%2E%2E")).toBeNull();
+    expect(
+      buildUpstreamUrl("https://api.example.com/v1", ["%252e%252e"], "/api/x/%252e%252e"),
+    ).toBeNull();
     expect(buildUpstreamUrl("https://api.example.com/v1", ["a/b"], "/api/x/a%2Fb")).toBeNull();
     expect(buildUpstreamUrl("https://api.example.com/v1", ["a\\b"], "/api/x/a%5Cb")).toBeNull();
+    expect(buildUpstreamUrl("https://api.example.com/v1", ["a\0b"], "/api/x/a%00b")).toBeNull();
+    expect(
+      buildUpstreamUrl("https://api.example.com/v1", ["items", ".."], "/api/x/items/.."),
+    ).toBeNull();
   });
 });
 
@@ -362,6 +372,24 @@ describe("proxy route", () => {
     const res = await request(app).get("/api/api1/fail");
     expect(res.status).toBe(500);
     expect(state.recorded.at(-1)).toMatchObject({ charged: false, responseStatus: 500 });
+  });
+
+  it("rejects path traversal and smuggled separators with 400 without forwarding or charging (#130)", async () => {
+    const recordedBefore = state.recorded.length;
+    seen = {};
+
+    const res1 = await request(app).get("/api/api1/..%2fadmin");
+    expect(res1.status).toBe(400);
+    expect(res1.body).toMatchObject({ error: "Invalid path", code: "invalid_path" });
+
+    const res2 = await request(app).get("/api/api1/%2e%2e");
+    expect(res2.status).toBe(400);
+    expect(res2.body).toMatchObject({ error: "Invalid path", code: "invalid_path" });
+
+    // Upstream server was never called
+    expect(seen.url).toBeUndefined();
+    // No call was charged or recorded
+    expect(state.recorded.length).toBe(recordedBefore);
   });
 
   it("maps oversize and slow upstream responses to 502/504", async () => {

@@ -95,6 +95,8 @@ import {
 import { config, upstreamKeyRing } from "../config.js";
 import { ProxyBufferSemaphore, proxyBufferConcurrency } from "../middleware/proxyBuffer.js";
 import { importBulkOpenApi, previewBulkOpenApi } from "../services/openApiImport.js";
+import { OpenApiSpecTooLargeError } from "../services/openApiSpec.js";
+import { proxyTrackingMiddleware } from "../middleware/proxyTracking.js";
 
 const router = Router();
 const openApiUpload = multer({ limits: { fileSize: 512 * 1024, files: 1 } });
@@ -131,8 +133,9 @@ router.post(
       return;
     }
     const result = previewBulkOpenApi(raw);
+    // Issue #214: oversized documents are 413; other validation failures stay 422.
     res
-      .status(result.errors.length > 0 ? 422 : 200)
+      .status(result.tooLarge ? 413 : result.errors.length > 0 ? 422 : 200)
       .json({ groups: result.groups, errors: result.errors });
   },
 );
@@ -158,7 +161,7 @@ router.post("/apis/import", apiKeyAuth, openApiUpload.single("document"), async 
     res.status(201).json(result);
   } catch (error) {
     res
-      .status(422)
+      .status(error instanceof OpenApiSpecTooLargeError ? 413 : 422)
       .json({ error: error instanceof Error ? error.message : "OpenAPI import failed" });
   }
 });
@@ -394,25 +397,90 @@ router.get("/payers/:address/entitlements", walletSignatureAuth, async (req, res
 
 // ── Paid proxy ────────────────────────────────────────────────────────────────
 
-/** Map /api/:id/<segments>?<query> onto the API's upstream URL. */
+/** Extract clean path segments from req.params.path (string or string array). */
+export function extractPathSegments(raw: unknown): string[] {
+  if (Array.isArray(raw)) {
+    return raw.flatMap((item) => (typeof item === "string" ? item.split("/").filter(Boolean) : []));
+  }
+  if (typeof raw === "string") {
+    return raw.split("/").filter(Boolean);
+  }
+  return [];
+}
+
+/**
+ * Map /api/:id/<segments>?<query> onto the API's upstream URL.
+ * Validates that the normalized request target stays strictly within the
+ * selected API's configured boundary (origin + base pathname).
+ * Returns null if any segment attempts traversal, contains invalid characters,
+ * or resolves outside the API's boundary.
+ */
 export function buildUpstreamUrl(
   upstreamUrl: string,
   segments: string[],
   originalUrl: string,
 ): URL | null {
-  // Segments arrive decoded. Refuse anything that could climb out of the
-  // upstream base path or smuggle a separator.
-  if (segments.some((s) => s === "." || s === ".." || /[/\\]/.test(s))) return null;
+  let base: URL;
+  try {
+    base = new URL(upstreamUrl);
+  } catch {
+    return null;
+  }
 
-  const base = new URL(upstreamUrl);
+  // Refuse anything that could climb out of the upstream base path,
+  // smuggle a separator, or introduce null bytes or control characters.
+  for (const s of segments) {
+    if (typeof s !== "string") return null;
+
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(s);
+    } catch {
+      return null;
+    }
+
+    if (
+      s === "." ||
+      s === ".." ||
+      decoded === "." ||
+      decoded === ".." ||
+      s.includes("/") ||
+      s.includes("\\") ||
+      decoded.includes("/") ||
+      decoded.includes("\\") ||
+      s.includes("\0") ||
+      decoded.includes("\0") ||
+      /%2e/i.test(s) ||
+      /%252e/i.test(s)
+    ) {
+      return null;
+    }
+  }
+
   const basePath = base.pathname.replace(/\/+$/, "");
   const subPath = segments.map(encodeURIComponent).join("/");
   const target = new URL(base.origin);
-  target.pathname = subPath ? `${basePath}/${subPath}` : basePath || "/";
+  const targetPath = subPath ? `${basePath}/${subPath}` : basePath || "/";
 
+  // Strict origin check: must match the configured upstream origin
+  if (target.origin !== base.origin) {
+    return null;
+  }
+
+  // Strict boundary check: normalized target must remain inside the API's configured basePath
+  if (basePath && basePath !== "/") {
+    if (targetPath !== basePath && !targetPath.startsWith(`${basePath}/`)) {
+      return null;
+    }
+  }
+
+  target.pathname = targetPath;
+
+  // Preserve upstream URL's existing query parameters while appending caller-supplied query
   const queryStart = originalUrl.indexOf("?");
   const requestQuery = queryStart === -1 ? "" : originalUrl.slice(queryStart + 1);
   target.search = [base.search.slice(1), requestQuery].filter(Boolean).join("&");
+
   return target;
 }
 
@@ -449,56 +517,6 @@ function settlementFrom(res: Response): SettlementInfo {
 
 function payerFrom(req: Request, settlement: SettlementInfo): string {
   return settlement.payer ?? payerFromPayment(paymentHeader(req)).address ?? "unknown";
-}
-
-/**
- * Resolve the payer address for a charged call.
- * Prefer the verified settlement payer from the PAYMENT-RESPONSE header,
- * then fall back to parsing the PAYMENT-SIGNATURE payload.
- */
-function resolvePayer(req: Request, res: Response): string {
-  const settlement = settlementFrom(res);
-  if (settlement.payer && settlement.payer !== "unknown") {
-    return settlement.payer;
-  }
-  const signature = req.get("PAYMENT-SIGNATURE") || req.get("X-PAYMENT") || undefined;
-  const parsed = parsePayerFromXPayment(signature);
-  return parsed || "unknown";
-}
-
-/**
- * Proxy finish handler: records the completed call.
- * Called after the upstream provider responds.
- */
-export async function finishHandler(req: Request, res: Response) {
-  const apiId = req.params.id;
-  const startedAt: number = (req as any).callStartedAt ?? Date.now();
-  const statusCode = res.statusCode;
-  const charged = Boolean((req as any).callCharged);
-  const latencyMs = Date.now() - startedAt;
-
-  let payerAddress: string | null = null;
-  let settlementTx: string | null = null;
-
-  if (charged) {
-    payerAddress = resolvePayer(req, res);
-    const settlement = settlementFrom(res);
-    settlementTx = settlement.transaction ?? null;
-  }
-
-  try {
-    await db.insert(apiCalls).values({
-      apiId,
-      statusCode,
-      latencyMs,
-      charged,
-      payerAddress,
-      settlementTx,
-      createdAt: new Date(),
-    });
-  } catch (err) {
-    console.error("Failed to record api call", err);
-  }
 }
 
 const UPSTREAM_ERROR_STATUS = { blocked: 502, network: 502, too_large: 502, timeout: 504 } as const;
@@ -674,10 +692,33 @@ function prepareUpstreamRequest(
   return secrets;
 }
 
+/**
+ * Validate that caller-supplied sub-path stays strictly within the selected API's
+ * boundary and contains no path traversal or separator smuggling.
+ * Runs early in the proxy middleware pipeline before charging or buffering.
+ */
+export function validateProxyPath(req: Request, res: Response, next: NextFunction): void {
+  const api = res.locals.api as ApiRow;
+  if (!api) {
+    res.status(404).json({ error: "API not found" });
+    return;
+  }
+  const segments = extractPathSegments(req.params.path);
+  const target = buildUpstreamUrl(api.upstreamUrl, segments, req.originalUrl);
+  if (!target) {
+    res.status(400).json({ error: "Invalid path", code: "invalid_path" });
+    return;
+  }
+  res.locals.upstreamTarget = target;
+  next();
+}
+
 async function proxyHandler(req: Request, res: Response) {
   const api = res.locals.api as ApiRow;
-  const segments = (req.params.path as unknown as string[] | undefined) ?? [];
-  const target = buildUpstreamUrl(api.upstreamUrl, segments, req.originalUrl);
+  const segments = extractPathSegments(req.params.path);
+  const target =
+    (res.locals.upstreamTarget as URL | undefined) ??
+    buildUpstreamUrl(api.upstreamUrl, segments, req.originalUrl);
   if (!target) {
     res.status(400).json({ error: "Invalid path", code: "invalid_path" });
     return;
@@ -714,6 +755,7 @@ async function proxyHandler(req: Request, res: Response) {
       amount,
       method: req.method,
       path,
+      txHash: settlement.transaction ?? null,
       responseStatus: res.statusCode,
       durationMs,
       // Charged-call webhook goes to the outbox in the same transaction (#208).
@@ -1109,9 +1151,11 @@ router.post("/api/:id/pass", loadProxiedApi, async (req: Request, res: Response)
 // ANY /api/:id[/*path] — one paid call to the provider's API
 router.all(
   "/api/:id{/*path}",
+  proxyTrackingMiddleware,
   proxyIpRateLimit,
   proxyBufferLimit,
   loadProxiedApi,
+  validateProxyPath,
   express.raw({ type: () => true, limit: config.PROXY_MAX_REQUEST_BODY }),
   checkPayerAllowDeny,
   checkPayerAccess,
